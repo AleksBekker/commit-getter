@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Has to be bash because:
+#   - `export` needed to make functions work in `xargs`
+#   - Colors may need bash?
+
+help() {
+  echo "Usage: $0 [OPTIONS]"
+  echo "  -h            Display this help."
+  echo "  -b            Enable boring mode: no colors."
+  echo "  -e <email>    The email associated with commits. Defaults to 'user.email' from your git configuration."
+  echo "  -c            Check if the links are valid."
+  echo "  -d <dir>      Directory of the git repository. Defaults to the current directory."
+  echo "  -r <remote>   Git remote name to use. Defaults to 'origin'."
+  echo "  -s <since>    Date since. Defaults to the beginning of time itself (1970-01-01)."
+  echo "  -v            Enable verbose output (doesn't interfere with stdout)."
+}
+
+backdir=$(pwd)
+dir=$(pwd)
+remote="origin"
+since="1970-01-01"
+
+NONE=0
+ERR=1
+INFO=2
+WARN=3
+ALL=9999
+verbosity=0
+
+CYAN="\033[0;36m"  # Cyan FG
+YELLOW="\033[0;33m"  # Yellow FG
+RED="\033[0;31m"  # Red FG
+NC="\033[0m"  # Default FG + BG
+
+info() {
+  if [ $verbosity -ge $INFO ]; then
+    echo -e "${CYAN}INFO: ${1}${NC}" >&2
+  fi
+}
+
+warn() {
+  if [ $verbosity -ge $WARN ]; then
+    echo -e "${YELLOW}WARNING: ${1}${NC}" >&2
+  fi
+}
+
+error() {
+  if [ $verbosity -ge $ERR ]; then
+    echo -e "${RED}ERROR: ${1}${NC}" >&2
+  fi
+  exit 1
+}
+
+while getopts 'd:e:r:s:bchv' opt; do
+  case $opt in
+    b)
+      YELLOW=""
+      CYAN=""
+      RED=""
+      NC="" ;;
+    c) check=true ;;
+    d) dir=$OPTARG ;;
+    e) email=$OPTARG ;;
+    h) help; exit 0 ;;
+    r) remote=$OPTARG ;;
+    s) since=$OPTARG ;;
+    v) verbosity=${ALL} ;;
+  esac
+done
+
+if ! git -C ${dir} rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  error "'${dir}' is not a git directory"
+fi
+
+if [ -z "$email" ]; then
+  warn "Email not provided. Attempting to use 'user.email'"
+  email=$(git -C "$dir" config user.email)
+fi
+
+if [ -z "$email" ]; then
+  error "Email not found in git configuration either. Please provide it with -e."
+fi
+
+commit_link() {
+  echo "$(sed -E '
+    s#^(git@|https?://)github.com[:/]#https://github.com/#;
+    s#(/|\.git)?$##
+  ')/commit/"
+}
+
+url=$(git -C "$dir" remote get-url ${remote} | commit_link)
+
+links=$(
+  git -C ${dir} log --pretty=format:${url}%H --author=${email} --since=${since} --all
+)
+
+if [ ! "$check" = true ]; then
+  echo "$links"
+  warn "These links have not been checked for validity. Rerun with -c to check."
+  exit 0
+fi
+
+validate() {
+  response=$(curl -s -o /dev/null -w "%{http_code}" $1)
+  case $response in
+    200) echo $1 ;;
+    400) info "'${1}' not found";;
+    429) warn
+      "'${1}' can't be checked due to rate limiting -- try again later." ;;
+    *) warn "'${1}' returns unexpected status '${response}'" ;;
+  esac
+}
+
+# TODO: figure out how to use /bin/sh syntax to accomplish this instead
+# TODO: fix verbosity levels inside the validate method
+export -f validate
+export -f info
+export -f warn
+export CYAN
+export YELLOW
+export NC
+# These exports are needed for the `xargs` command to work with the `validate`
+# function. Essentially, `xargs` spawns a new shell for every process, and these
+# exports ensure that the link validation function is usable in the children
+# shells. Seeing as this is the only section in the script not runnable by a
+# POSIX shell, I'd like to replace it with one that is.
+
+info "Link checking started"
+
+# TODO: use /bin/sh here instead of bash
+echo "${links}" | xargs -P 10 -I {} bash -c 'validate {}'
+
+info "Link checking complete"
